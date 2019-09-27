@@ -465,8 +465,8 @@ lws_create_adopt_udp2(struct lws *wsi, const char *ads,
 		 * function is for.
 		 */
 
-#if defined(LWS_PLAT_FREERTOS) || defined(WIN32)
-		/* these plats don't have the defs at the moment */
+#if !defined(__linux__)
+		/* PF_PACKET is linux-only */
 		sock.sockfd = socket(wsi->dns_results_next->ai_family,
 				     SOCK_DGRAM, IPPROTO_UDP);
 #else

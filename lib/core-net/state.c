@@ -108,9 +108,18 @@ int
 lws_state_transition_steps(lws_state_manager_t *mgr, int target)
 {
 	int n = 0;
+#if defined(_DEBUG)
+	int i = mgr->state;
+	char temp8[8];
+#endif
 
 	while (!n && mgr->state != target)
 		n = _lws_state_transition(mgr, mgr->state + 1);
+
+#if defined(_DEBUG)
+	lwsl_info("%s: %s -> %s\n", __func__, _systnm(mgr, i, temp8),
+			_systnm(mgr, mgr->state, temp8));
+#endif
 
 	return 0;
 }

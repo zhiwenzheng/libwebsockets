@@ -274,6 +274,7 @@ lws_plat_inet_pton(int af, const char *src, void *dst)
 int
 lws_plat_ifname_to_hwaddr(int fd, const char *ifname, uint8_t *hwaddr, int len)
 {
+#if defined(__linux__)
 	struct ifreq i;
 
 	memset(&i, 0, sizeof(i));
@@ -285,12 +286,18 @@ lws_plat_ifname_to_hwaddr(int fd, const char *ifname, uint8_t *hwaddr, int len)
 	memcpy(hwaddr, &i.ifr_hwaddr.sa_data, 6);
 
 	return 6;
+#else
+	lwsl_err("%s: UNIMPLEMENTED on this platform\n", __func__);
+
+	return -1;
+#endif
 }
 
 int
 lws_plat_rawudp_broadcast(uint8_t *p, const uint8_t *canned, int canned_len,
 			  int n, int fd, const char *iface)
 {
+#if defined(__linux__)
 	struct sockaddr_ll sll;
 	uint16_t *p16 = (uint16_t *)p;
 	uint32_t ucs = 0;
@@ -319,11 +326,17 @@ lws_plat_rawudp_broadcast(uint8_t *p, const uint8_t *canned, int canned_len,
 	memset(sll.sll_addr, 0xff, 6);
 
 	return sendto(fd, p, n, 0, (struct sockaddr *)&sll, sizeof(sll));
+#else
+	lwsl_err("%s: UNIMPLEMENTED on this platform\n", __func__);
+
+	return -1;
+#endif
 }
 
 int
 lws_plat_if_up(const char *ifname, int fd, int up)
 {
+#if defined(__linux__)
 	struct ifreq ifr;
 
 	memset(&ifr, 0, sizeof(ifr));
@@ -345,11 +358,17 @@ lws_plat_if_up(const char *ifname, int fd, int up)
 	}
 
 	return 0;
+#else
+	lwsl_err("%s: UNIMPLEMENTED on this platform\n", __func__);
+
+	return -1;
+#endif
 }
 
 int
 lws_plat_BINDTODEVICE(int fd, const char *ifname)
 {
+#if defined(__linux__)
 	struct ifreq i;
 
 	memset(&i, 0, sizeof(i));
@@ -362,12 +381,18 @@ lws_plat_BINDTODEVICE(int fd, const char *ifname)
 	}
 
 	return 0;
+#else
+	lwsl_err("%s: UNIMPLEMENTED on this platform\n", __func__);
+
+	return -1;
+#endif
 }
 
 int
 lws_plat_ifconfig_ip(const char *ifname, int fd, uint8_t *ip, uint8_t *mask_ip,
 			uint8_t *gateway_ip)
 {
+#if defined(__linux__)
 	struct sockaddr_in *addr;
 	struct sockaddr_in sin;
 	struct rtentry route;
@@ -420,4 +445,9 @@ lws_plat_ifconfig_ip(const char *ifname, int fd, uint8_t *ip, uint8_t *mask_ip,
 	}
 
 	return 0;
+#else
+	lwsl_err("%s: UNIMPLEMENTED on this platform\n", __func__);
+
+	return -1;
+#endif
 }
