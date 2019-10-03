@@ -15,8 +15,16 @@ typedef struct lws_system_ops {
 	int (*get_info)(lws_system_item_t i, lws_system_arg_t *arg);
 	int (*reboot)(void);
 	int (*set_clock)(lws_usec_t us);
+	int (*auth)(int idx, uint8_t *buf, size_t *plen, int set);
 } lws_system_ops_t;
 ```
+
+|Item|Meaning|
+|---|---|
+|`(*get_info)()`|Retreive system information in a standardized way|
+|`(*reboot)()`|Reboot the system|
+|`(*set_clock)()`|Set the system clock|
+|`(*auth)()`|Set and Get dynamic auth strings|
 
 ### `get_info`
 
@@ -36,7 +44,12 @@ Reboots the device
 
 ### `set_clock`
 
-Set the system clock to us-resolution Unix time in secods
+Set the system clock to us-resolution Unix time in seconds
+
+### `auth`
+
+This allows storing and retrival of binary auth codes in a standardized way.
+Call with `set` 0 to get and 1 to set the auth code with the index `idx`. 
 
 ## System state and notifiers
 
