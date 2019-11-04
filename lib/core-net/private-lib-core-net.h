@@ -39,6 +39,10 @@
 #endif
 #endif
 
+#if defined(__sun)
+#include <sys/loadavg.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
