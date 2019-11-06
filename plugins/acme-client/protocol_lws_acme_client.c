@@ -42,12 +42,14 @@
 #include <string.h>
 #include <stdlib.h>
 
+
 typedef enum {
 	ACME_STATE_DIRECTORY,	/* get the directory JSON using GET + parse */
 	ACME_STATE_NEW_NONCE,	/* get the replay nonce */
 	ACME_STATE_NEW_ACCOUNT,	/* register a new RSA key + email combo */
 	ACME_STATE_NEW_ORDER,	/* start the process to request a cert */
 	ACME_STATE_AUTHZ,	/* */
+	ACME_STATE_UPDATE_DNS_RECORD,
 	ACME_STATE_START_CHALL, /* notify server ready for one challenge */
 	ACME_STATE_POLLING,	/* he should be trying our challenge */
 	ACME_STATE_POLLING_CSR,	/* sent CSR, checking result */
@@ -55,6 +57,15 @@ typedef enum {
 
 	ACME_STATE_FINISHED
 } lws_acme_state;
+
+#define MAX_AUTHZ 2
+
+struct authz {
+	char url[100];
+	char status[10];
+	unsigned int wildcard:1;    /* true or false */
+	unsigned int type:2;        /* http-01, dns-01, tlp */
+};
 
 struct acme_connection {
 	char buf[4096];
@@ -68,7 +79,9 @@ struct acme_connection {
 	struct lws_http_mount mount;
 	char urls[6][100]; /* directory contents */
 	char active_url[100];
-	char authz_url[100];
+	struct authz authz[MAX_AUTHZ];
+	int authz_count;
+	int authz_idx;
 	char order_url[100];
 	char finalize_url[100];
 	char cert_url[100];
@@ -98,9 +111,7 @@ struct acme_connection {
 
 	size_t len_privkey_pem;
 
-	unsigned int yes:2;
 	unsigned int use:1;
-	unsigned int is_sni_02:1;
 };
 
 struct per_vhost_data__lws_acme_client {
@@ -127,84 +138,6 @@ struct per_vhost_data__lws_acme_client {
 
 	int fd_updated_cert; /* these are opened while we have root... */
 	int fd_updated_key; /* ...if nonempty next startup will replace old */
-};
-
-static int
-callback_chall_http01(struct lws *wsi, enum lws_callback_reasons reason,
-        void *user, void *in, size_t len)
-{
-	struct lws_vhost *vhost = lws_get_vhost(wsi);
-	struct acme_connection *ac = lws_vhost_user(vhost);
-	uint8_t buf[LWS_PRE + 2048], *start = &buf[LWS_PRE], *p = start,
-		*end = &buf[sizeof(buf) - LWS_PRE - 1];
-	int n;
-
-	switch (reason) {
-	case LWS_CALLBACK_HTTP:
-		lwsl_notice("%s: ca connection received, key_auth %s\n",
-			    __func__, ac->key_auth);
-
-		if (lws_add_http_header_status(wsi, HTTP_STATUS_OK, &p, end)) {
-			lwsl_notice("%s: add status failed\n", __func__);
-			return -1;
-		}
-
-		if (lws_add_http_header_by_token(wsi,
-					WSI_TOKEN_HTTP_CONTENT_TYPE,
-					(unsigned char *)"text/plain", 10,
-					&p, end)) {
-			lwsl_notice("%s: add content_type failed\n", __func__);
-			return -1;
-		}
-
-		n = strlen(ac->key_auth);
-		if (lws_add_http_header_content_length(wsi, n, &p, end)) {
-			lwsl_notice("%s: add content_length failed\n",
-					__func__);
-			return -1;
-		}
-
-		if (lws_add_http_header_by_token(wsi,
-					WSI_TOKEN_HTTP_CONTENT_DISPOSITION,
-					(unsigned char *)"attachment", 10,
-					&p, end)) {
-			lwsl_notice("%s: add content_dispo failed\n", __func__);
-			return -1;
-		}
-
-		if (lws_finalize_write_http_header(wsi, start, &p, end)) {
-			lwsl_notice("%s: finalize http header failed\n",
-					__func__);
-			return -1;
-		}
-
-		lws_callback_on_writable(wsi);
-		return 0;
-
-	case LWS_CALLBACK_HTTP_WRITEABLE:
-		p += lws_snprintf((char *)p, end - p, "%s", ac->key_auth);
-		lwsl_notice("%s: len %d\n", __func__, lws_ptr_diff(p, start));
-		if (lws_write(wsi, (uint8_t *)start, lws_ptr_diff(p, start),
-			      LWS_WRITE_HTTP_FINAL) != lws_ptr_diff(p, start)) {
-			lwsl_err("_write content failed\n");
-			return 1;
-		}
-
-		if (lws_http_transaction_completed(wsi))
-			return -1;
-
-		return 0;
-
-	default:
-		break;
-	}
-
-	return lws_callback_http_dummy(wsi, reason, user, in, len);
-}
-
-static const struct lws_protocols chall_http01_protocols[] = {
-	{ "http", callback_chall_http01, 0, 0, 0, NULL, 0 },
-	{ NULL, NULL, 0, 0, 0, NULL, 0 }
 };
 
 static int
@@ -401,7 +334,7 @@ cb_order(struct lejp_ctx *ctx, char reason)
 	struct acme_connection *s = (struct acme_connection *)ctx->user;
 
 	if (reason == LEJPCB_CONSTRUCTED)
-		s->authz_url[0] = '\0';
+		s->authz[s->authz_count].url[0] = '\0';
 
 	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
 		return 0;
@@ -417,8 +350,10 @@ cb_order(struct lejp_ctx *ctx, char reason)
 	case JAO_IDENTIFIERS_VALUE:
 		break;
 	case JAO_AUTHORIZATIONS:
-		lws_snprintf(s->authz_url, sizeof(s->authz_url), "%s",
-			     ctx->buf);
+		lwsl_notice("authorizations: %s\n", ctx->buf);
+		lws_snprintf(s->authz[s->authz_count].url,
+			sizeof(s->authz[0].url), "%s", ctx->buf);
+		s->authz_count++;
 		break;
 	case JAO_FINALIZE:
 		lws_snprintf(s->finalize_url, sizeof(s->finalize_url), "%s",
@@ -443,7 +378,8 @@ static const char * const jauthz_tok[] = {
 	"challenges[].status",
 	"challenges[].url",
 	"challenges[].token",
-	"detail"
+	"detail",
+	"wildcard"
 };
 
 enum enum_jauthz_tok {
@@ -456,6 +392,7 @@ enum enum_jauthz_tok {
 	JAAZ_CHALLENGES_URL,
 	JAAZ_CHALLENGES_TOKEN,
 	JAAZ_DETAIL,
+	JAAZ_WILDCARD
 };
 
 static signed char
@@ -464,7 +401,6 @@ cb_authz(struct lejp_ctx *ctx, char reason)
 	struct acme_connection *s = (struct acme_connection *)ctx->user;
 
 	if (reason == LEJPCB_CONSTRUCTED) {
-		s->yes = 0;
 		s->use = 0;
 		s->chall_token[0] = '\0';
 	}
@@ -478,34 +414,36 @@ cb_authz(struct lejp_ctx *ctx, char reason)
 	case JAAZ_ID_VALUE:
 		break;
 	case JAAZ_STATUS:
+		lwsl_notice("JAAZ_STATUS: %s\n", ctx->buf);
+		lws_strncpy(s->authz[s->authz_idx].status, ctx->buf,
+			sizeof(s->authz[s->authz_idx].status));
 		break;
 	case JAAZ_EXPIRES:
 		break;
 	case JAAZ_DETAIL:
 		lws_snprintf(s->detail, sizeof(s->detail), "%s", ctx->buf);
 		break;
+	case JAAZ_WILDCARD:
+		s->authz[s->authz_idx].wildcard = 1;
+		break;
 	case JAAZ_CHALLENGES_TYPE:
 		lwsl_notice("JAAZ_CHALLENGES_TYPE: %s\n", ctx->buf);
-		s->use = !strcmp(ctx->buf, "http-01");
+		s->use = !strcmp(ctx->buf, "dns-01");
 		break;
 	case JAAZ_CHALLENGES_STATUS:
 		lws_strncpy(s->status, ctx->buf, sizeof(s->status));
 		break;
 	case JAAZ_CHALLENGES_URL:
 		lwsl_notice("JAAZ_CHALLENGES_URL: %s %d\n", ctx->buf, s->use);
-		if (s->use) {
+		if (s->use)
 			lws_strncpy(s->challenge_uri, ctx->buf,
-				    sizeof(s->challenge_uri));
-			s->yes |= 2;
-		}
+					sizeof(s->challenge_uri));
 		break;
 	case JAAZ_CHALLENGES_TOKEN:
 		lwsl_notice("JAAZ_CHALLENGES_TOKEN: %s %d\n", ctx->buf, s->use);
-		if (s->use) {
+		if (s->use)
 			lws_strncpy(s->chall_token, ctx->buf,
-				    sizeof(s->chall_token));
-			s->yes |= 1;
-		}
+					sizeof(s->chall_token));
 		break;
 	}
 
@@ -535,10 +473,8 @@ cb_chac(struct lejp_ctx *ctx, char reason)
 {
 	struct acme_connection *s = (struct acme_connection *)ctx->user;
 
-	if (reason == LEJPCB_CONSTRUCTED) {
-		s->yes = 0;
+	if (reason == LEJPCB_CONSTRUCTED)
 		s->use = 0;
-	}
 
 	if (!(reason & LEJP_FLAG_CB_IS_VALUE) || !ctx->path_match)
 		return 0;
@@ -552,11 +488,9 @@ cb_chac(struct lejp_ctx *ctx, char reason)
 		lws_strncpy(s->status, ctx->buf, sizeof(s->status));
 		break;
 	case JCAC_URI:
-		s->yes |= 2;
 		break;
 	case JCAC_TOKEN:
 		lws_strncpy(s->chall_token, ctx->buf, sizeof(s->chall_token));
-		s->yes |= 1;
 		break;
 	case JCAC_DETAIL:
 		lws_snprintf(s->detail, sizeof(s->detail), "%s", ctx->buf);
@@ -570,7 +504,7 @@ static int
 lws_acme_report_status(struct lws_vhost *v, int state, const char *json)
 {
 	lws_callback_vhost_protocols_vhost(v, LWS_CALLBACK_VHOST_CERT_UPDATE,
-					   (void *)json, state);
+						(void *)json, state);
 
 	return 0;
 }
@@ -612,7 +546,7 @@ lws_acme_client_connect(struct lws_context *context, struct lws_vhost *vh,
 	wsi = lws_client_connect_via_info(i);
 	if (!wsi) {
 		lws_snprintf(path, sizeof(path) - 1,
-			     "Unable to connect to %s", url);
+				"Unable to connect to %s", url);
 		lwsl_notice("%s: %s\n", __func__, path);
 		lws_acme_report_status(vh, LWS_CUS_FAILED, path);
 	}
@@ -771,7 +705,7 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 		lws_protocol_vh_priv_get(lws_get_vhost(wsi),
 				lws_get_protocol(wsi));
 	char buf[LWS_PRE + 2536], *start = buf + LWS_PRE, *p = start,
-		 *end = buf + sizeof(buf) - 1, digest[32], *failreason = NULL;
+		*end = buf + sizeof(buf) - 1, digest[32], *failreason = NULL;
 	const struct lws_protocol_vhost_options *pvo;
 	struct lws_acme_cert_aging_args *caa;
 	struct acme_connection *ac = NULL;
@@ -823,15 +757,14 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 		n = 0;
 		for (m = 0; m < (int)LWS_ARRAY_SIZE(pvo_names); m++) {
 			if (!vhd->pvop[m] &&
-				m >= LWS_TLS_REQ_ELEMENT_COMMON_NAME &&
-				m != LWS_TLS_REQ_ELEMENT_SUBJECT_ALT_NAME) {
+					m >= LWS_TLS_REQ_ELEMENT_COMMON_NAME) {
 				lwsl_notice("%s: require pvo '%s'\n", __func__,
-					    pvo_names[m]);
+						pvo_names[m]);
 				n |= 1;
 			} else {
 				if (vhd->pvop[m])
 					lwsl_info("  %s: %s\n", pvo_names[m],
-						  vhd->pvop[m]);
+						vhd->pvop[m]);
 			}
 		}
 		if (n) {
@@ -980,13 +913,13 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 		case ACME_STATE_NEW_ACCOUNT:
 			if (!lws_hdr_total_length(wsi,
-						  WSI_TOKEN_HTTP_LOCATION)) {
+					WSI_TOKEN_HTTP_LOCATION)) {
 				lwsl_notice("%s: no Location\n", __func__);
 				goto failed;
 			}
 
 			if (lws_hdr_copy(wsi, ac->acct_id, sizeof(ac->acct_id),
-					 WSI_TOKEN_HTTP_LOCATION) < 0) {
+						WSI_TOKEN_HTTP_LOCATION) < 0) {
 				lwsl_notice("%s: Location too large\n",
 						__func__);
 				goto failed;
@@ -999,8 +932,8 @@ callback_acme_client(struct lws *wsi, enum lws_callback_reasons reason,
 
 		case ACME_STATE_NEW_ORDER:
 			if (lws_hdr_copy(wsi, ac->order_url,
-					 sizeof(ac->order_url),
-					 WSI_TOKEN_HTTP_LOCATION) < 0) {
+					sizeof(ac->order_url),
+					WSI_TOKEN_HTTP_LOCATION) < 0) {
 				lwsl_notice("%s: missing cert location:\n",
 						__func__);
 
@@ -1108,9 +1041,12 @@ pkt_add_hdrs:
 					"\"identifiers\":[{"
 					"\"type\":\"dns\","
 					"\"value\":\"%s\""
-					"}]"
-					"}",
-			vhd->pvop_active[LWS_TLS_REQ_ELEMENT_COMMON_NAME]);
+					"}, {"
+					"\"type\":\"dns\","
+					"\"value\":\"%s\""
+					"}]}",
+			vhd->pvop_active[LWS_TLS_REQ_ELEMENT_COMMON_NAME],
+			vhd->pvop_active[LWS_TLS_REQ_ELEMENT_SUBJECT_ALT_NAME]);
 
 			puts(start);
 			strcpy(ac->active_url, ac->urls[JAD_NEW_ORDER_URL]);
@@ -1118,8 +1054,62 @@ pkt_add_hdrs:
 
 		case ACME_STATE_AUTHZ:
 			puts(start);
-			strcpy(ac->active_url, ac->authz_url);
+			strcpy(ac->active_url, ac->authz[ac->authz_idx].url);
+			lwsl_notice("used authz_url %s\n", ac->active_url);
+
 			goto pkt_add_hdrs;
+
+		case ACME_STATE_UPDATE_DNS_RECORD:
+
+			pp = (uint8_t **)in;
+			pend = *pp + len - 1;
+
+			{
+				char domain_buf[64], host_buf[64], zone_buf[64],
+					key_buf[128];
+
+				lws_snprintf(key_buf, sizeof(key_buf), "\"%s\"",
+						ac->key_auth);
+				ac->len = lws_snprintf(&ac->buf[LWS_PRE],
+						sizeof(ac->buf) - LWS_PRE,
+						"domainname=%s&hostname=%s&"
+						"zonename=%s&rtype=TXT&"
+						"value=%s",
+						lws_urlencode(domain_buf,
+							"88811.me",
+							sizeof(domain_buf)),
+						lws_urlencode(host_buf,
+							"mice",
+							sizeof(host_buf)),
+						lws_urlencode(zone_buf,
+							"_acme-challenge",
+							sizeof(zone_buf)),
+						key_buf);
+			}
+
+			n = lws_snprintf(buf, sizeof(buf) - 1,
+				"PUT_THE_AUTH_COOKIE_HERE");
+			if (lws_add_http_header_by_token(wsi,
+				WSI_TOKEN_HTTP_COOKIE, (uint8_t *)buf, n, pp,
+				pend))
+				return -1;
+
+			n = lws_snprintf(buf, sizeof(buf) - 1,
+				"application/x-www-form-urlencoded");
+			if (lws_add_http_header_by_token(wsi,
+				WSI_TOKEN_HTTP_CONTENT_TYPE,
+				(uint8_t *)buf, n, pp, pend))
+				return -1;
+
+			n = lws_snprintf(buf, sizeof(buf) - 1,  "%d", ac->len);
+			if (lws_add_http_header_by_token(wsi,
+				WSI_TOKEN_HTTP_CONTENT_LENGTH,
+				(uint8_t *)buf, n, pp, pend))
+				return -1;
+
+			lws_client_http_body_pending(wsi, 1);
+			lws_callback_on_writable(wsi);
+			break;
 
 		case ACME_STATE_START_CHALL:
 			p = start;
@@ -1298,19 +1288,18 @@ pkt_add_hdrs:
 
 		case ACME_STATE_NEW_ORDER:
 			lejp_destruct(&ac->jctx);
-			if (!ac->authz_url[0]) {
+			if (!ac->authz[0].url[0]) {
 				lwsl_notice("no authz\n");
 				goto failed;
 			}
-
+authz_domain:
 			/*
 			 * Move on to requesting a cert auth.
 			 */
 			ac->state = ACME_STATE_AUTHZ;
-			lws_acme_report_status(vhd->vhost, LWS_CUS_AUTH,
-					NULL);
+			lws_acme_report_status(vhd->vhost, LWS_CUS_AUTH, NULL);
 
-			strcpy(buf, ac->authz_url);
+			strcpy(buf, ac->authz[ac->authz_idx].url);
 			cwsi = lws_acme_client_connect(vhd->context,
 					vhd->vhost, &ac->cwsi,
 					&ac->i, buf, "POST");
@@ -1329,6 +1318,22 @@ pkt_add_hdrs:
 				lwsl_notice("auth failed\n");
 				goto failed;
 			}
+
+			lwsl_notice("authz status: %s\n",
+					ac->authz[ac->authz_idx].status);
+
+			if (!strcmp(ac->authz[ac->authz_idx].status, "valid")) {
+				/* already validated */
+				if (ac->authz_idx++ < ac->authz_count - 1) {
+					lws_timed_callback_vh_protocol(
+						vhd->vhost, vhd->protocol,
+						LWS_CALLBACK_USER + 0xac33, 1);
+					return -1;
+				} else {
+					goto finalize_order;
+				}
+			}
+
 			lwsl_notice("chall: %s (%d)\n", ac->chall_token,
 					ac->resp);
 			if (!ac->chall_token[0]) {
@@ -1336,81 +1341,88 @@ pkt_add_hdrs:
 				goto failed;
 			}
 
-			ac->state = ACME_STATE_START_CHALL;
-			lws_acme_report_status(vhd->vhost, LWS_CUS_CHALLENGE,
-					NULL);
+			{
+				/* compute the key authorization */
+				char s[256];
+				char digest2[32];
+				struct lws_genhash_ctx hash_ctx;
 
-			memset(&ac->ci, 0, sizeof(ac->ci));
+				p = s;
+				end = p + sizeof(s) - 1;
 
-			/* compute the key authorization */
+				p += lws_snprintf(p, end - p, "%s.", ac->chall_token);
+				lws_jwk_rfc7638_fingerprint(&vhd->jwk, digest);
+				n = lws_jws_base64_enc(digest, 32, p, end - p);
+				if (n < 0)
+					goto failed;
 
-			p = ac->key_auth;
-			end = p + sizeof(ac->key_auth) - 1;
+				if (lws_genhash_init(&hash_ctx, LWS_GENHASH_TYPE_SHA256))
+					goto failed;
 
-			p += lws_snprintf(p, end - p, "%s.", ac->chall_token);
-			lws_jwk_rfc7638_fingerprint(&vhd->jwk, digest);
-			n = lws_jws_base64_enc(digest, 32, p, end - p);
-			if (n < 0)
-				goto failed;
+				if (lws_genhash_update(&hash_ctx, s, strlen(s))) {
+					lws_genhash_destroy(&hash_ctx, NULL);
+					goto failed;
+				}
 
-			lwsl_notice("key_auth: '%s'\n", ac->key_auth);
+				if (lws_genhash_destroy(&hash_ctx, digest2))
+					goto failed;
 
-			lws_snprintf(ac->http01_mountpoint,
-					sizeof(ac->http01_mountpoint),
-					"/.well-known/acme-challenge/%s",
-					ac->chall_token);
+				n = lws_jws_base64_enc(digest2, 32, ac->key_auth,
+						sizeof(ac->key_auth));
+				if (n < 0)
+					goto failed;
 
-			memset(&ac->mount, 0, sizeof (struct lws_http_mount));
-			ac->mount.protocol = "http";
-			ac->mount.mountpoint = ac->http01_mountpoint;
-			ac->mount.mountpoint_len =
-				strlen(ac->http01_mountpoint);
-			ac->mount.origin_protocol = LWSMPRO_CALLBACK;
+				lwsl_notice("key_auth: '%s'\n", ac->key_auth);
+			}
 
-			ac->ci.mounts = &ac->mount;
+			ac->state = ACME_STATE_UPDATE_DNS_RECORD;
 
-			/* listen on the same port as the vhost that triggered
-			 * us */
-			ac->ci.port = 80;
-
-			/* make ourselves protocols[0] for the new vhost */
-			ac->ci.protocols = chall_http01_protocols;
-
-			/*
-			 * vhost .user points to the ac associated with the
-			 * temporary vhost
-			 */
-			ac->ci.user = ac;
-
-			ac->vhost = lws_create_vhost(lws_get_context(wsi),
-					&ac->ci);
-			if (!ac->vhost)
-				goto failed;
-
-			lwsl_notice("challenge_uri %s\n", ac->challenge_uri);
-
-			/*
-			 * The challenge-specific vhost is up... let the ACME
-			 * server know we are ready to roll...
-			 */
-			ac->goes_around = 0;
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
-						       &ac->cwsi, &ac->i,
-						       ac->challenge_uri,
-						       "POST");
+					&ac->cwsi, &ac->i,
+					"https://88811.me/updaterecord",
+					"POST");
 			if (!cwsi) {
-				lwsl_notice("%s: connect failed\n", __func__);
+				lwsl_notice("%s: failed to connect\n", __func__);
 				goto failed;
 			}
+
 			return -1; /* close the completed client connection */
+
+		case ACME_STATE_UPDATE_DNS_RECORD:
+			if (ac->resp != 200) {
+				lwsl_notice("update dns record failed\n");
+				goto failed;
+			}
+
+			/*
+			 * The dns record is setup... let the ACME
+			 * server know we are ready to roll...
+			 */
+			ac->state = ACME_STATE_START_CHALL;
+
+			lws_acme_report_status(vhd->vhost, LWS_CUS_CHALLENGE,
+					NULL);
+			lwsl_notice("challenge_uri %s\n", ac->challenge_uri);
+
+			ac->goes_around = 0;
+			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
+					&ac->cwsi, &ac->i,
+					ac->challenge_uri,
+					"POST");
+			if (!cwsi) {
+				lwsl_notice("%s: failed to connect\n",
+						__func__);
+				goto failed;
+			}
+			return -1;
 
 		case ACME_STATE_START_CHALL:
 			lwsl_notice("%s: COMPLETED start chall: %s\n",
-				    __func__, ac->challenge_uri);
+					__func__, ac->challenge_uri);
 poll_again:
 			ac->state = ACME_STATE_POLLING;
 			lws_acme_report_status(vhd->vhost, LWS_CUS_CHALLENGE,
-					       NULL);
+						NULL);
 
 			if (ac->goes_around++ == 20) {
 				lwsl_notice("%s: too many chall retries\n",
@@ -1421,8 +1433,8 @@ poll_again:
 
 			strcpy(buf, ac->order_url);
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
-						       &ac->cwsi, &ac->i, buf,
-						       "POST");
+							&ac->cwsi, &ac->i, buf,
+							"POST");
 			if (!cwsi) {
 				lwsl_notice("%s: failed to connect to acme\n",
 						__func__);
@@ -1434,7 +1446,7 @@ poll_again:
 		case ACME_STATE_POLLING:
 
 			if (ac->resp == 202 && strcmp(ac->status, "invalid") &&
-					       strcmp(ac->status, "valid")) {
+					strcmp(ac->status, "valid")) {
 				lwsl_notice("status: %s\n", ac->status);
 				goto poll_again;
 			}
@@ -1453,16 +1465,15 @@ poll_again:
 				goto failed;
 			}
 
-			lwsl_notice("Challenge passed\n");
+			lwsl_notice("Challenge passed for one domain\n");
 
-			/*
-			 * The challenge was validated... so delete the
-			 * temp vhost now its job is done
-			 */
-			if (ac->vhost)
-				lws_vhost_destroy(ac->vhost);
-			ac->vhost = NULL;
+			if (ac->authz_idx++ < ac->authz_count - 1) {
+				lws_timed_callback_vh_protocol(vhd->vhost, vhd->protocol,
+						LWS_CALLBACK_USER + 0xac33, 1);
+				return -1;
+			}
 
+finalize_order:
 			/*
 			 * now our JWK is accepted as authorized to make
 			 * requests for the domain, next move is create the
@@ -1473,10 +1484,12 @@ poll_again:
 			lws_acme_report_status(vhd->vhost, LWS_CUS_REQ, NULL);
 			ac->goes_around = 0;
 
+			lwsl_notice("finalize_url %s\n", ac->finalize_url);
+
 			strcpy(buf, ac->finalize_url);
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
-						       &ac->cwsi, &ac->i, buf,
-						       "POST");
+							&ac->cwsi, &ac->i, buf,
+							"POST");
 			if (!cwsi) {
 				lwsl_notice("%s: failed to connect to acme\n",
 						__func__);
@@ -1519,8 +1532,8 @@ poll_again:
 
 			strcpy(buf, ac->cert_url);
 			cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
-						       &ac->cwsi, &ac->i, buf,
-						       "POST");
+							&ac->cwsi, &ac->i, buf,
+							"POST");
 			if (!cwsi) {
 				lwsl_notice("%s: failed to connect to acme\n",
 						__func__);
@@ -1533,7 +1546,7 @@ poll_again:
 
 			if (ac->resp != 200) {
 				lwsl_notice("download cert failed on resp %d\n",
-					    ac->resp);
+						ac->resp);
 				goto failed;
 			}
 			lwsl_notice("The cert was sent..\n");
@@ -1601,15 +1614,8 @@ poll_again:
 	case LWS_CALLBACK_USER + 0xac33:
 		if (!vhd)
 			break;
-		cwsi = lws_acme_client_connect(vhd->context, vhd->vhost,
-				&ac->cwsi, &ac->i,
-				ac->challenge_uri,
-				"GET");
-		if (!cwsi) {
-			lwsl_notice("%s: failed to connect\n", __func__);
-			goto failed;
-		}
-		break;
+
+		goto authz_domain;
 
 	default:
 		break;
@@ -1633,7 +1639,7 @@ static const struct lws_protocols protocols[] = {
 
 LWS_EXTERN LWS_VISIBLE int
 init_protocol_lws_acme_client(struct lws_context *context,
-			      struct lws_plugin_capability *c)
+				struct lws_plugin_capability *c)
 {
 	if (c->api_magic != LWS_PLUGIN_API_MAGIC) {
 		lwsl_err("Plugin API %d, library API %d", LWS_PLUGIN_API_MAGIC,
