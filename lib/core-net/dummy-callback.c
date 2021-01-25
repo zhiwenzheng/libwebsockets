@@ -147,12 +147,6 @@ lws_callback_ws_proxy(struct lws *wsi, enum lws_callback_reasons reason,
 	}
 
 	case LWS_CALLBACK_CLIENT_RECEIVE:
-		wsi->parent->ws->proxy_buffered += len;
-		if (wsi->parent->ws->proxy_buffered > 10 * 1024 * 1024) {
-			lwsl_err("%s: proxied ws connection excessive buffering: dropping\n",
-					__func__);
-			return -1;
-		}
 		pkt = lws_zalloc(sizeof(*pkt) + LWS_PRE + len, __func__);
 		if (!pkt)
 			return -1;
@@ -165,6 +159,11 @@ lws_callback_ws_proxy(struct lws *wsi, enum lws_callback_reasons reason,
 		memcpy(((uint8_t *)&pkt[1]) + LWS_PRE, in, len);
 
 		lws_dll2_add_tail(&pkt->pkt_list, &wsi->parent->ws->proxy_owner);
+		wsi->parent->ws->proxy_buffered += len;
+
+		if (wsi->parent->ws->proxy_buffered > 10 * 1024 * 1024)
+			lws_rx_flow_control(wsi, 0);
+
 		lws_callback_on_writable(wsi->parent);
 		break;
 
@@ -228,6 +227,9 @@ lws_callback_ws_proxy(struct lws *wsi, enum lws_callback_reasons reason,
 
 		lws_dll2_remove(dll);
 		lws_free(pkt);
+
+		if (wsi->ws->proxy_buffered < 5 * 1024 * 1024)
+			lws_rx_flow_control(wsi->child_list, 1);
 
 		if (lws_dll2_get_head(&wsi->ws->proxy_owner))
 			lws_callback_on_writable(wsi);
